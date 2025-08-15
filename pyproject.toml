@@ -1,0 +1,95 @@
+[project]
+name = "httpx-secure"
+requires-python = ">=3.9"
+dependencies = ["httpx", "anyio"]
+description = "Drop-in SSRF protection for httpx"
+readme = "README.md"
+license = "0BSD"
+keywords = [
+  "anyio",
+  "async",
+  "asyncio",
+  "client",
+  "dns-cache",
+  "dns",
+  "http",
+  "httpx",
+  "security",
+  "ssrf-protection",
+  "ssrf",
+  "trio",
+  "web-security",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Zero-Clause BSD (0BSD)",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Framework :: AsyncIO",
+  "Framework :: Trio",
+  "Framework :: AnyIO",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Security",
+  "Topic :: System :: Networking",
+  "Typing :: Typed",
+]
+authors = [{ name = "Kamil Monicz", email = "kamil@monicz.dev" }]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/Zaczero/httpx-secure"
+Issues = "https://github.com/Zaczero/httpx-secure/issues"
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "httpx_secure/__init__.py"
+
+[tool.uv]
+package = true
+python-downloads = "never"
+python-preference = "only-system"
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "httpx_secure/__init__.py" },
+]
+
+[tool.ruff]
+indent-width = 4
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+ignore = ["ANN", "D", "PGH", "INP", "S101", "TRY", "EM", "PLR2004", "S311"]
+select = ["ALL"]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+preview = true
+
+[tool.pyright]
+include = ["httpx_secure"]
+pythonVersion = "3.9"
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+addopts = "--quiet --import-mode=importlib --strict-markers --strict-config"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_mode = "auto"
+minversion = "6.0"
+testpaths = ["tests"]
