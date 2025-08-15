@@ -95,6 +95,7 @@ class _SSRFProtectionHook:
     __slots__ = (
         "_cache",
         "_locks",
+        "check_globally_reachable",
         "custom_validator",
     )
 
@@ -102,6 +103,7 @@ class _SSRFProtectionHook:
         self,
         *,
         cache: _DNSCache,
+        check_globally_reachable: bool,
         custom_validator: (
             Callable[
                 [str, _IPAddress, int],
@@ -112,6 +114,7 @@ class _SSRFProtectionHook:
     ):
         self._cache = cache
         self._locks: WeakValueDictionary[_CacheKey, Lock] = WeakValueDictionary()
+        self.check_globally_reachable = check_globally_reachable
         self.custom_validator = custom_validator
 
     async def _resolve(self, hostname: str, port: int) -> str:
@@ -158,7 +161,7 @@ class _SSRFProtectionHook:
                 port=port,
             ) from e
 
-        if not ip_addr.is_global:
+        if self.check_globally_reachable and not ip_addr.is_global:
             raise SSRFProtectionError(
                 f"Access denied: IP address {ip_str!r} is not globally reachable",
                 hostname=hostname,
@@ -217,6 +220,7 @@ class _SSRFProtectionHook:
 def httpx_ssrf_protection(
     client: _AsyncClientT,
     *,
+    check_globally_reachable: bool = True,
     custom_validator: (
         Callable[
             [str, _IPAddress, int],
@@ -232,6 +236,7 @@ def httpx_ssrf_protection(
 
     Args:
         client: AsyncClient to configure
+        check_globally_reachable: Whether to block non-global IP addresses
         custom_validator: Additional validation function(hostname, ip, port) -> bool
         dns_cache_size: Maximum number of DNS resolutions to cache
         dns_cache_ttl: Time-to-live for cached DNS resolutions in seconds
@@ -239,9 +244,16 @@ def httpx_ssrf_protection(
     Returns:
         The same client instance with SSRF protection configured.
     """
+    if not check_globally_reachable and custom_validator is None:
+        raise ValueError(
+            "When check_globally_reachable is False, custom_validator must be provided "
+            "to ensure SSRF protection is not completely disabled",
+        )
+
     client.event_hooks["request"].append(
         _SSRFProtectionHook(
             cache=_DNSCache(dns_cache_size, dns_cache_ttl),
+            check_globally_reachable=check_globally_reachable,
             custom_validator=custom_validator,
         ),
     )

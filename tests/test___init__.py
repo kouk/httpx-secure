@@ -33,7 +33,6 @@ async def client():
     ],
 )
 async def test_blocks_localhost(client, url):
-    """Test that localhost addresses are blocked."""
     with pytest.raises(SSRFProtectionError, match="not globally reachable"):
         await client.get(url)
 
@@ -50,7 +49,6 @@ async def test_blocks_localhost(client, url):
     ],
 )
 async def test_blocks_private_networks(client, url):
-    """Test that private network addresses are blocked."""
     with pytest.raises(SSRFProtectionError, match="not globally reachable"):
         await client.get(url)
 
@@ -64,14 +62,11 @@ async def test_blocks_private_networks(client, url):
     ],
 )
 async def test_allows_global_addresses(client, url):
-    """Test that global IP addresses are allowed and trigger success hook."""
     with pytest.raises(SuccessError):
         await client.get(url)
 
 
-async def test_dns_resolution_and_validation():
-    """Test real DNS resolution with success hook pattern."""
-
+async def test_dns_resolution_rewrites_host_header():
     async def success_hook(request: Request):
         assert request.url.host == "1.2.3.4"
         assert request.headers["Host"] == "example.com"
@@ -89,8 +84,7 @@ async def test_dns_resolution_and_validation():
                 await client.get("https://example.com/")
 
 
-async def test_dns_caching():
-    """Test that DNS results are cached."""
+async def test_dns_results_are_cached():
     dns_call_count = 0
 
     def mock_getaddrinfo_counter(*_):
@@ -119,9 +113,7 @@ async def test_dns_caching():
             assert dns_call_count == 2
 
 
-async def test_custom_validator():
-    """Test custom validator."""
-
+async def test_custom_validator_blocks_specific_ips():
     async with httpx_ssrf_protection(
         AsyncClient(),
         custom_validator=(
@@ -137,8 +129,7 @@ async def test_custom_validator():
             await client.get("http://1.1.1.1/")
 
 
-async def test_invalid_hostname():
-    """Test that invalid hostnames raise appropriate errors."""
+async def test_dns_resolution_failure_raises_error():
     async with httpx_ssrf_protection(AsyncClient()) as client:
         with patch("httpx_secure.getaddrinfo") as mock_getaddrinfo:
             mock_getaddrinfo.side_effect = gaierror("Name or service not known")
@@ -146,3 +137,29 @@ async def test_invalid_hostname():
                 await client.get(
                     "http://this-hostname-definitely-does-not-exist/",
                 )
+
+
+async def test_skips_global_check_when_disabled():
+    async with httpx_ssrf_protection(
+        AsyncClient(),
+        check_globally_reachable=False,
+        custom_validator=lambda _, ip_addr, __: str(ip_addr) != "127.0.0.1",
+    ) as client:
+        client.event_hooks["request"].append(success_hook)
+
+        with pytest.raises(SuccessError):
+            await client.get("http://192.168.1.1/")
+
+        with pytest.raises(SSRFProtectionError, match="failed custom validation"):
+            await client.get("http://127.0.0.1/")
+
+
+async def test_disabling_global_check_requires_custom_validator():
+    with pytest.raises(
+        ValueError,
+        match="to ensure SSRF protection is not completely disabled",
+    ):
+        httpx_ssrf_protection(
+            AsyncClient(),
+            check_globally_reachable=False,
+        )
