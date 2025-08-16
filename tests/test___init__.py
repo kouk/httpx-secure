@@ -13,6 +13,8 @@ TYPE_CHECKING = False
 if TYPE_CHECKING:
     from anyio.abc import IPAddressType
 
+MOCK_DEFAULT_IP = "1.2.3.4"
+
 
 class SuccessError(BaseException):
     """Raised when SSRF validation passes successfully."""
@@ -22,7 +24,7 @@ async def success_hook(_: Request):
     raise SuccessError
 
 
-def mock_tcp(default_ip: str = "1.2.3.4"):
+def mock_tcp(default_ip: str = MOCK_DEFAULT_IP):
     async def connect_tcp(remote_host: IPAddressType, remote_port: int, *_, **__):
         hostname = str(remote_host)
         port = remote_port
@@ -105,7 +107,7 @@ async def test_allows_global_addresses(client, url):
 
 async def test_dns_resolution_rewrites_host_header():
     async def success_hook(request: Request):
-        assert request.url.host == "1.2.3.4"
+        assert request.url.host == MOCK_DEFAULT_IP
         assert request.headers["Host"] == "example.com"
         assert request.extensions["sni_hostname"] == "example.com"
         raise SuccessError
