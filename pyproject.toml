@@ -74,7 +74,19 @@ line-length = 88
 target-version = "py39"
 
 [tool.ruff.lint]
-ignore = ["ANN", "D", "PGH", "INP", "S101", "TRY", "EM", "PLR2004", "S311"]
+ignore = [
+  "ANN",
+  "D",
+  "E501",
+  "EM",
+  "INP",
+  "PGH",
+  "PLR",
+  "S101",
+  "S311",
+  "SLF001",
+  "TRY",
+]
 select = ["ALL"]
 fixable = ["ALL"]
 unfixable = []

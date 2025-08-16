@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from socket import gaierror
-from unittest.mock import patch
+from ipaddress import ip_address
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from anyio import ConnectionFailed, getaddrinfo
+from anyio.abc import IPAddressType
 from httpx import AsyncClient, Request
 
 from httpx_secure import SSRFProtectionError, httpx_ssrf_protection
@@ -15,6 +17,38 @@ class SuccessError(BaseException):
 
 async def success_hook(_: Request):
     raise SuccessError
+
+
+def mock_tcp(default_ip: str = "1.2.3.4"):
+    async def connect_tcp(remote_host: IPAddressType, remote_port: int, *_, **__):
+        hostname = str(remote_host)
+        port = remote_port
+
+        if "." not in hostname:
+            # Resolve local hosts
+            addr_info = await getaddrinfo(hostname, port)
+            resolved_ip = addr_info[0][4][0]
+        else:
+            try:
+                ip_address(hostname)
+                resolved_ip = hostname
+            except ValueError:
+                resolved_ip = default_ip
+
+        stream = Mock()
+        stream._raw_socket = Mock()
+        stream._raw_socket.getpeername.return_value = (resolved_ip, port)
+        stream.__aenter__ = AsyncMock(return_value=stream)
+        stream.__aexit__ = AsyncMock(return_value=None)
+        return stream
+
+    return connect_tcp
+
+
+@pytest.fixture(autouse=True)
+def mock_tcp_fixture():
+    with patch("httpx_secure.connect_tcp", side_effect=mock_tcp()) as mock:
+        yield mock
 
 
 @pytest.fixture
@@ -75,42 +109,34 @@ async def test_dns_resolution_rewrites_host_header():
 
     async with httpx_ssrf_protection(AsyncClient()) as client:
         client.event_hooks["request"].append(success_hook)
-
-        with patch("httpx_secure.getaddrinfo") as mock_getaddrinfo:
-            mock_getaddrinfo.return_value = [
-                (None, None, None, None, ("1.2.3.4", 443)),
-            ]
-            with pytest.raises(SuccessError):
-                await client.get("https://example.com/")
+        with pytest.raises(SuccessError):
+            await client.get("https://example.com/")
 
 
-async def test_dns_results_are_cached():
-    dns_call_count = 0
+async def test_dns_results_are_cached(mock_tcp_fixture):
+    call_count = 0
 
-    def mock_getaddrinfo_counter(*_):
-        nonlocal dns_call_count
-        dns_call_count += 1
-        return [(None, None, None, None, ("1.2.3.4", 443))]
+    async def counter(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return await mock_tcp()(*args, **kwargs)
+
+    mock_tcp_fixture.side_effect = counter
 
     async with httpx_ssrf_protection(AsyncClient(), dns_cache_ttl=5) as client:
         client.event_hooks["request"].append(success_hook)
 
-        with patch("httpx_secure.getaddrinfo", side_effect=mock_getaddrinfo_counter):
-            with pytest.raises(SuccessError):
-                await client.get("https://example.com/")
-            assert dns_call_count == 1
+        with pytest.raises(SuccessError):
+            await client.get("https://example.com/")
+        assert call_count == 1
 
-            with pytest.raises(SuccessError):
-                await client.get("https://example.com/")
-            assert dns_call_count == 1
+        with pytest.raises(SuccessError):
+            await client.get("https://example.com/path")
+        assert call_count == 1
 
-            with pytest.raises(SuccessError):
-                await client.get("https://example.com/path")
-            assert dns_call_count == 1
-
-            with pytest.raises(SuccessError):
-                await client.get("https://api.example.com/path")
-            assert dns_call_count == 2
+        with pytest.raises(SuccessError):
+            await client.get("https://api.example.com/path")
+        assert call_count == 2
 
 
 async def test_custom_validator_blocks_specific_ips():
@@ -129,14 +155,14 @@ async def test_custom_validator_blocks_specific_ips():
             await client.get("http://1.1.1.1/")
 
 
-async def test_dns_resolution_failure_raises_error():
+async def test_dns_resolution_failure_raises_error(mock_tcp_fixture):
+    mock_tcp_fixture.side_effect = ConnectionFailed(["Name or service not known"])
+
     async with httpx_ssrf_protection(AsyncClient()) as client:
-        with patch("httpx_secure.getaddrinfo") as mock_getaddrinfo:
-            mock_getaddrinfo.side_effect = gaierror("Name or service not known")
-            with pytest.raises(SSRFProtectionError, match="Failed to resolve hostname"):
-                await client.get(
-                    "http://this-hostname-definitely-does-not-exist/",
-                )
+        with pytest.raises(SSRFProtectionError, match="Failed to resolve hostname"):
+            await client.get(
+                "http://this-hostname-definitely-does-not-exist/",
+            )
 
 
 async def test_skips_global_check_when_disabled():

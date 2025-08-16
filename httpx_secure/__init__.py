@@ -3,11 +3,10 @@ from __future__ import annotations
 from collections import OrderedDict
 from inspect import isawaitable
 from ipaddress import ip_address
-from socket import IPPROTO_TCP, SOCK_STREAM, gaierror, getaddrinfo
 from time import monotonic
 from weakref import WeakValueDictionary
 
-from anyio import Lock, to_thread
+from anyio import ConnectionFailed, Lock, connect_tcp
 from httpx import RequestError
 
 TYPE_CHECKING = False
@@ -24,7 +23,7 @@ if TYPE_CHECKING:
 
     _AsyncClientT = TypeVar("_AsyncClientT", bound=AsyncClient)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 class SSRFProtectionError(RequestError):
@@ -97,6 +96,7 @@ class _SSRFProtectionHook:
         "_locks",
         "check_globally_reachable",
         "custom_validator",
+        "happy_eyeballs_delay",
     )
 
     def __init__(
@@ -111,23 +111,23 @@ class _SSRFProtectionHook:
             ]
             | None
         ),
+        happy_eyeballs_delay: float,
     ):
         self._cache = cache
         self._locks: WeakValueDictionary[_CacheKey, Lock] = WeakValueDictionary()
         self.check_globally_reachable = check_globally_reachable
         self.custom_validator = custom_validator
+        self.happy_eyeballs_delay = happy_eyeballs_delay
 
     async def _resolve(self, hostname: str, port: int) -> str:
         try:
-            addr_info = await to_thread.run_sync(
-                getaddrinfo,
+            async with await connect_tcp(
                 hostname,
                 port,
-                0,
-                SOCK_STREAM,
-                IPPROTO_TCP,
-            )
-        except gaierror as e:
+                happy_eyeballs_delay=self.happy_eyeballs_delay,
+            ) as stream:
+                addr_info = stream._raw_socket.getpeername()
+        except ConnectionFailed as e:
             raise SSRFProtectionError(
                 f"Failed to resolve hostname {hostname!r}: {e}",
                 hostname=hostname,
@@ -135,15 +135,7 @@ class _SSRFProtectionHook:
                 port=port,
             ) from e
 
-        if not addr_info:
-            raise SSRFProtectionError(
-                f"No IP addresses found for hostname {hostname!r}",
-                hostname=hostname,
-                ip_addr=None,
-                port=port,
-            )
-
-        return str(addr_info[0][4][0])
+        return addr_info[0]
 
     async def _validate(
         self,
@@ -229,7 +221,8 @@ def httpx_ssrf_protection(
         | None
     ) = None,
     dns_cache_size: int = 1000,
-    dns_cache_ttl: float = 300,
+    dns_cache_ttl: float = 600,
+    happy_eyeballs_delay: float = 0.25,
 ) -> _AsyncClientT:
     """
     Configure SSRF protection on an httpx AsyncClient with DNS caching.
@@ -240,7 +233,7 @@ def httpx_ssrf_protection(
         custom_validator: Additional validation function(hostname, ip, port) -> bool
         dns_cache_size: Maximum number of DNS resolutions to cache
         dns_cache_ttl: Time-to-live for cached DNS resolutions in seconds
-
+        happy_eyeballs_delay: Delay in seconds before starting the next connection attempt
     Returns:
         The same client instance with SSRF protection configured.
     """
@@ -255,6 +248,7 @@ def httpx_ssrf_protection(
             cache=_DNSCache(dns_cache_size, dns_cache_ttl),
             check_globally_reachable=check_globally_reachable,
             custom_validator=custom_validator,
+            happy_eyeballs_delay=happy_eyeballs_delay,
         ),
     )
     return client
