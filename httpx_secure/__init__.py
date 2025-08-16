@@ -50,7 +50,7 @@ class _DNSCache:
     def __init__(self, max_size: int, ttl: float) -> None:
         self._cache: OrderedDict[
             _CacheKey,
-            tuple[float, str],
+            tuple[float, str | SSRFProtectionError],
         ] = OrderedDict()
         self._max_size = max_size
         self._ttl = ttl
@@ -59,7 +59,7 @@ class _DNSCache:
         self,
         key: _CacheKey,
         /,
-    ) -> str | None:
+    ) -> str | SSRFProtectionError | None:
         cached_value = self._cache.get(key)
         if cached_value is None:
             return None
@@ -77,7 +77,7 @@ class _DNSCache:
     def put(
         self,
         key: _CacheKey,
-        value: str,
+        value: str | SSRFProtectionError,
         /,
     ) -> None:
         current_time = monotonic()
@@ -181,6 +181,8 @@ class _SSRFProtectionHook:
         cache_key = (hostname, port)
         result = self._cache.get(cache_key)
         if result is not None:
+            if isinstance(result, SSRFProtectionError):
+                raise result
             return result
 
         lock = self._locks.get(cache_key)
@@ -190,10 +192,18 @@ class _SSRFProtectionHook:
         async with lock:
             result = self._cache.get(cache_key)
             if result is not None:
+                if isinstance(result, SSRFProtectionError):
+                    raise result
                 return result
 
             ip_str = await self._resolve(hostname, port)
-            await self._validate(ip_str, port, hostname)
+
+            try:
+                await self._validate(ip_str, port, hostname)
+            except SSRFProtectionError as e:
+                self._cache.put(cache_key, e)
+                raise
+
             self._cache.put(cache_key, ip_str)
             return ip_str
 

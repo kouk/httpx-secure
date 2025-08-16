@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from ipaddress import ip_address
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from anyio import ConnectionFailed, getaddrinfo
-from anyio.abc import IPAddressType
 from httpx import AsyncClient, Request
 
 from httpx_secure import SSRFProtectionError, httpx_ssrf_protection
+
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from anyio.abc import IPAddressType
 
 
 class SuccessError(BaseException):
@@ -140,19 +143,35 @@ async def test_dns_results_are_cached(mock_tcp_fixture):
 
 
 async def test_custom_validator_blocks_specific_ips():
+    call_count = 0
+
+    def custom_validator(
+        _: str,
+        ip_addr: IPv4Address | IPv6Address,
+        __: int,
+    ) -> bool:
+        nonlocal call_count
+        call_count += 1
+        return str(ip_addr) not in {"8.8.8.8", "8.8.4.4"}
+
     async with httpx_ssrf_protection(
         AsyncClient(),
-        custom_validator=(
-            lambda _, ip_addr, __: str(ip_addr) not in {"8.8.8.8", "8.8.4.4"}
-        ),
+        custom_validator=custom_validator,
     ) as client:
         client.event_hooks["request"].append(success_hook)
 
         with pytest.raises(SSRFProtectionError, match="failed custom validation"):
             await client.get("http://8.8.8.8/")
+        assert call_count == 1
 
         with pytest.raises(SuccessError):
             await client.get("http://1.1.1.1/")
+        assert call_count == 2
+
+        # Another request to blocked IP should still use cache
+        with pytest.raises(SSRFProtectionError, match="failed custom validation"):
+            await client.get("http://8.8.8.8/different/path")
+        assert call_count == 2
 
 
 async def test_dns_resolution_failure_raises_error(mock_tcp_fixture):
