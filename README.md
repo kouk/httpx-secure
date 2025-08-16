@@ -30,7 +30,7 @@ from httpx_secure import httpx_ssrf_protection
 client = httpx_ssrf_protection(
     httpx.AsyncClient(),
     dns_cache_size=1000,  # Cache up to 1000 DNS resolutions
-    dns_cache_ttl=300,    # Cache for 5 minutes
+    dns_cache_ttl=600,    # Cache for 10 minutes
 )
 
 await client.get("https://public.domain")   # Allowed

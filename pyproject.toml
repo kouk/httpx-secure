@@ -1,7 +1,7 @@
 [project]
 name = "httpx-secure"
 requires-python = ">=3.9"
-dependencies = ["httpx", "anyio"]
+dependencies = ["httpx>=0.20.0", "anyio>=3.0.0"]
 description = "Drop-in SSRF protection for httpx"
 readme = "README.md"
 license = "0BSD"

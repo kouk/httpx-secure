@@ -109,8 +109,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anyio" },
-    { name = "httpx" },
+    { name = "anyio", specifier = ">=3.0.0" },
+    { name = "httpx", specifier = ">=0.20.0" },
 ]
 
 [package.metadata.requires-dev]
