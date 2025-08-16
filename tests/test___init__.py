@@ -20,7 +20,7 @@ class SuccessError(BaseException):
     """Raised when SSRF validation passes successfully."""
 
 
-async def success_hook(_: Request):
+def success_hook(_: Request):
     raise SuccessError
 
 
