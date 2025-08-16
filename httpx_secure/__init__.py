@@ -95,8 +95,8 @@ class _SSRFProtectionHook:
         "_cache",
         "_locks",
         "check_globally_reachable",
-        "custom_validator",
         "connect_timeout",
+        "custom_validator",
         "happy_eyeballs_delay",
     )
 
@@ -105,6 +105,7 @@ class _SSRFProtectionHook:
         *,
         cache: _DNSCache,
         check_globally_reachable: bool,
+        connect_timeout: float | None,
         custom_validator: (
             Callable[
                 [str, _IPAddress, int],
@@ -112,14 +113,13 @@ class _SSRFProtectionHook:
             ]
             | None
         ),
-        connect_timeout: float | None,
         happy_eyeballs_delay: float,
     ):
         self._cache = cache
         self._locks: WeakValueDictionary[_CacheKey, Lock] = WeakValueDictionary()
         self.check_globally_reachable = check_globally_reachable
-        self.custom_validator = custom_validator
         self.connect_timeout = connect_timeout
+        self.custom_validator = custom_validator
         self.happy_eyeballs_delay = happy_eyeballs_delay
 
     async def _resolve(self, request: Request, hostname: str, port: int) -> str:
@@ -257,8 +257,8 @@ def httpx_ssrf_protection(
         _SSRFProtectionHook(
             cache=_DNSCache(dns_cache_size, dns_cache_ttl),
             check_globally_reachable=check_globally_reachable,
-            custom_validator=custom_validator,
             connect_timeout=client.timeout.connect,
+            custom_validator=custom_validator,
             happy_eyeballs_delay=happy_eyeballs_delay,
         ),
     )
