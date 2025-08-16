@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from anyio import ConnectionFailed, getaddrinfo
-from httpx import AsyncClient, Request
+from httpx import AsyncClient, ConnectError, Request
 
 from httpx_secure import SSRFProtectionError, httpx_ssrf_protection
 
@@ -177,10 +177,10 @@ async def test_custom_validator_blocks_specific_ips():
 
 
 async def test_dns_resolution_failure_raises_error(mock_tcp_fixture):
-    mock_tcp_fixture.side_effect = ConnectionFailed(["Name or service not known"])
+    mock_tcp_fixture.side_effect = ConnectionFailed("Name or service not known")
 
     async with httpx_ssrf_protection(AsyncClient()) as client:
-        with pytest.raises(SSRFProtectionError, match="Failed to resolve hostname"):
+        with pytest.raises(ConnectError, match="Name or service not known"):
             await client.get(
                 "http://this-hostname-definitely-does-not-exist/",
             )

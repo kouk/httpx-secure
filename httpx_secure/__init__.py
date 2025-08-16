@@ -6,8 +6,8 @@ from ipaddress import ip_address
 from time import monotonic
 from weakref import WeakValueDictionary
 
-from anyio import ConnectionFailed, Lock, connect_tcp
-from httpx import RequestError
+from anyio import Lock, connect_tcp, fail_after
+from httpx import ConnectError, ConnectTimeout, RequestError
 
 TYPE_CHECKING = False
 if TYPE_CHECKING:
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
     _AsyncClientT = TypeVar("_AsyncClientT", bound=AsyncClient)
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 class SSRFProtectionError(RequestError):
@@ -96,6 +96,7 @@ class _SSRFProtectionHook:
         "_locks",
         "check_globally_reachable",
         "custom_validator",
+        "connect_timeout",
         "happy_eyeballs_delay",
     )
 
@@ -111,31 +112,29 @@ class _SSRFProtectionHook:
             ]
             | None
         ),
+        connect_timeout: float | None,
         happy_eyeballs_delay: float,
     ):
         self._cache = cache
         self._locks: WeakValueDictionary[_CacheKey, Lock] = WeakValueDictionary()
         self.check_globally_reachable = check_globally_reachable
         self.custom_validator = custom_validator
+        self.connect_timeout = connect_timeout
         self.happy_eyeballs_delay = happy_eyeballs_delay
 
-    async def _resolve(self, hostname: str, port: int) -> str:
+    async def _resolve(self, request: Request, hostname: str, port: int) -> str:
         try:
-            async with await connect_tcp(
-                hostname,
-                port,
-                happy_eyeballs_delay=self.happy_eyeballs_delay,
-            ) as stream:
-                addr_info = stream._raw_socket.getpeername()
-        except ConnectionFailed as e:
-            raise SSRFProtectionError(
-                f"Failed to resolve hostname {hostname!r}: {e}",
-                hostname=hostname,
-                ip_addr=None,
-                port=port,
-            ) from e
-
-        return addr_info[0]
+            with fail_after(self.connect_timeout):
+                async with await connect_tcp(
+                    hostname,
+                    port,
+                    happy_eyeballs_delay=self.happy_eyeballs_delay,
+                ) as stream:
+                    return stream._raw_socket.getpeername()[0]
+        except TimeoutError as e:
+            raise ConnectTimeout(str(e), request=request) from e
+        except OSError as e:
+            raise ConnectError(str(e), request=request) from e
 
     async def _validate(
         self,
@@ -175,6 +174,7 @@ class _SSRFProtectionHook:
 
     async def _process(
         self,
+        request: Request,
         hostname: str,
         port: int,
     ) -> str:
@@ -196,7 +196,7 @@ class _SSRFProtectionHook:
                     raise result
                 return result
 
-            ip_str = await self._resolve(hostname, port)
+            ip_str = await self._resolve(request, hostname, port)
 
             try:
                 await self._validate(ip_str, port, hostname)
@@ -212,7 +212,7 @@ class _SSRFProtectionHook:
         hostname = url.host
         port = url.port or (443 if url.scheme in {"https", "wss"} else 80)
 
-        ip_str = await self._process(hostname, port)
+        ip_str = await self._process(request, hostname, port)
 
         request.url = url.copy_with(host=ip_str)
         request.headers["Host"] = hostname
@@ -258,6 +258,7 @@ def httpx_ssrf_protection(
             cache=_DNSCache(dns_cache_size, dns_cache_ttl),
             check_globally_reachable=check_globally_reachable,
             custom_validator=custom_validator,
+            connect_timeout=client.timeout.connect,
             happy_eyeballs_delay=happy_eyeballs_delay,
         ),
     )
