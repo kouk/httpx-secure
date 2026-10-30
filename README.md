@@ -68,10 +68,11 @@ await client.get("https://unknown.domain")      # Blocked
 ## How It Works
 
 1. **Cache Lookup**: First checks if the host has been recently validated and cached
-2. **DNS Resolution**: If not cached, resolves the hostname to all of its IP addresses with a DNS lookup (no connection is opened)
+2. **DNS Resolution**: If not cached, resolves the hostname to all of its IP addresses
 3. **Validation**: Verifies every IP is globally routable, blocking private/internal addresses
 4. **Custom Validation**: If provided, your custom validator is called for every IP for additional checks
-5. **Request Modification**: Rewrites the request to use the first validated IP directly
+5. **Address Selection**: If there is more than one IP, connects to the validated IPs with Happy Eyeballs and picks the first that answers (never before validation)
+6. **Request Modification**: Rewrites the request to use the selected IP directly
 
 The DNS cache significantly reduces latency for repeated requests, while per-host locking ensures efficient concurrent resolution of parallel requests.
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from socket import AF_INET, AF_INET6, SOCK_STREAM
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from anyio import getaddrinfo, sleep
@@ -44,6 +44,28 @@ def mock_dns(default_ips: tuple[str, ...] = (MOCK_DEFAULT_IP,)):
 @pytest.fixture(autouse=True)
 def mock_dns_fixture():
     with patch("httpx_secure.getaddrinfo", side_effect=mock_dns()) as mock:
+        yield mock
+
+
+def mock_connect(
+    refused: frozenset[str] = frozenset(),
+    hanging: frozenset[str] = frozenset(),
+):
+    async def connect_tcp(remote_host: str, *_, **__):
+        if remote_host in refused:
+            raise ConnectionRefusedError(f"refused: {remote_host}")
+        if remote_host in hanging:
+            await sleep(60)
+        stream = Mock()
+        stream.aclose = AsyncMock()
+        return stream
+
+    return connect_tcp
+
+
+@pytest.fixture(autouse=True)
+def mock_connect_fixture():
+    with patch("httpx_secure.connect_tcp", side_effect=mock_connect()) as mock:
         yield mock
 
 
@@ -215,19 +237,101 @@ async def test_blocks_when_any_resolved_address_is_private(mock_dns_fixture, ips
             await client.get("https://example.com/")
 
 
-async def test_uses_first_resolved_address(mock_dns_fixture):
-    mock_dns_fixture.side_effect = mock_dns(
-        default_ips=("2001:4860:4860::8888", "8.8.8.8", "8.8.8.8"),
-    )
+DUAL_STACK_IPS = ("8.8.8.8", "2001:4860:4860::8888")
 
+
+def assert_selected_host(expected: str):
     async def success_hook(request: Request):
-        assert request.url.host == "2001:4860:4860::8888"
+        assert request.url.host == expected
         raise SuccessError
 
+    return success_hook
+
+
+async def test_single_address_is_used_without_probing(mock_connect_fixture):
     async with httpx_ssrf_protection(AsyncClient()) as client:
-        client.event_hooks["request"].append(success_hook)
+        client.event_hooks["request"].append(assert_selected_host(MOCK_DEFAULT_IP))
         with pytest.raises(SuccessError):
             await client.get("https://example.com/")
+    mock_connect_fixture.assert_not_called()
+
+
+async def test_prefers_ipv6_when_reachable(mock_dns_fixture, mock_connect_fixture):
+    mock_dns_fixture.side_effect = mock_dns(default_ips=DUAL_STACK_IPS)
+
+    async with httpx_ssrf_protection(AsyncClient()) as client:
+        client.event_hooks["request"].append(
+            assert_selected_host("2001:4860:4860::8888"),
+        )
+        with pytest.raises(SuccessError):
+            await client.get("https://example.com/")
+    mock_connect_fixture.assert_called_once()
+
+
+async def test_falls_back_when_address_refuses(mock_dns_fixture, mock_connect_fixture):
+    mock_dns_fixture.side_effect = mock_dns(default_ips=DUAL_STACK_IPS)
+    mock_connect_fixture.side_effect = mock_connect(
+        refused=frozenset({"2001:4860:4860::8888"}),
+    )
+
+    async with httpx_ssrf_protection(AsyncClient()) as client:
+        client.event_hooks["request"].append(assert_selected_host("8.8.8.8"))
+        with pytest.raises(SuccessError):
+            await client.get("https://example.com/")
+
+
+async def test_falls_back_when_address_hangs(mock_dns_fixture, mock_connect_fixture):
+    mock_dns_fixture.side_effect = mock_dns(default_ips=DUAL_STACK_IPS)
+    mock_connect_fixture.side_effect = mock_connect(
+        hanging=frozenset({"2001:4860:4860::8888"}),
+    )
+
+    async with httpx_ssrf_protection(
+        AsyncClient(),
+        happy_eyeballs_delay=0.01,
+    ) as client:
+        client.event_hooks["request"].append(assert_selected_host("8.8.8.8"))
+        with pytest.raises(SuccessError):
+            await client.get("https://example.com/")
+
+
+async def test_all_addresses_unreachable_raises_error(
+    mock_dns_fixture,
+    mock_connect_fixture,
+):
+    mock_dns_fixture.side_effect = mock_dns(default_ips=DUAL_STACK_IPS)
+    mock_connect_fixture.side_effect = mock_connect(refused=frozenset(DUAL_STACK_IPS))
+
+    async with httpx_ssrf_protection(AsyncClient()) as client:
+        with pytest.raises(ConnectError, match="All connection attempts failed"):
+            await client.get("https://example.com/")
+
+
+async def test_all_addresses_hanging_raises_timeout(
+    mock_dns_fixture,
+    mock_connect_fixture,
+):
+    mock_dns_fixture.side_effect = mock_dns(default_ips=DUAL_STACK_IPS)
+    mock_connect_fixture.side_effect = mock_connect(hanging=frozenset(DUAL_STACK_IPS))
+
+    async with httpx_ssrf_protection(
+        AsyncClient(timeout=Timeout(5, connect=0.05)),
+        happy_eyeballs_delay=0.01,
+    ) as client:
+        with pytest.raises(ConnectTimeout):
+            await client.get("https://example.com/")
+
+
+async def test_validates_every_address_before_probing(
+    mock_dns_fixture,
+    mock_connect_fixture,
+):
+    mock_dns_fixture.side_effect = mock_dns(default_ips=("8.8.8.8", "10.0.0.1"))
+
+    async with httpx_ssrf_protection(AsyncClient()) as client:
+        with pytest.raises(SSRFProtectionError, match="not globally reachable"):
+            await client.get("https://example.com/")
+    mock_connect_fixture.assert_not_called()
 
 
 async def test_does_not_connect_before_validation():

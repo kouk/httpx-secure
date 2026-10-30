@@ -3,11 +3,19 @@ from __future__ import annotations
 from collections import OrderedDict
 from inspect import isawaitable
 from ipaddress import ip_address
-from socket import SOCK_STREAM
+from socket import AF_INET, AF_INET6, SOCK_STREAM
 from time import monotonic
 from weakref import WeakValueDictionary
 
-from anyio import Lock, fail_after, getaddrinfo
+from anyio import (
+    Event,
+    Lock,
+    connect_tcp,
+    create_task_group,
+    fail_after,
+    getaddrinfo,
+    move_on_after,
+)
 from httpx import ConnectError, ConnectTimeout, RequestError
 
 TYPE_CHECKING = False
@@ -98,6 +106,7 @@ class _SSRFProtectionHook:
         "check_globally_reachable",
         "connect_timeout",
         "custom_validator",
+        "happy_eyeballs_delay",
     )
 
     def __init__(
@@ -113,12 +122,14 @@ class _SSRFProtectionHook:
             ]
             | None
         ),
+        happy_eyeballs_delay: float,
     ):
         self._cache = cache
         self._locks: WeakValueDictionary[_CacheKey, Lock] = WeakValueDictionary()
         self.check_globally_reachable = check_globally_reachable
         self.connect_timeout = connect_timeout
         self.custom_validator = custom_validator
+        self.happy_eyeballs_delay = happy_eyeballs_delay
 
     async def _resolve(
         self,
@@ -134,11 +145,72 @@ class _SSRFProtectionHook:
         except OSError as e:
             raise ConnectError(str(e), request=request) from e
 
-        # Preserve the order returned by the resolver, drop duplicates
-        ip_strs = list(dict.fromkeys(str(info[4][0]) for info in addr_info))
+        # Same order as anyio.connect_tcp: first IPv6, then first IPv4, then the rest
+        ip_strs: list[str] = []
+        v6_found = v4_found = False
+        for family, *_, sockaddr in addr_info:
+            ip_str = str(sockaddr[0])
+            if ip_str in ip_strs:
+                continue
+            if family == AF_INET6 and not v6_found:
+                v6_found = True
+                ip_strs.insert(0, ip_str)
+            elif family == AF_INET and not v4_found and v6_found:
+                v4_found = True
+                ip_strs.insert(1, ip_str)
+            else:
+                ip_strs.append(ip_str)
+
         if not ip_strs:
             raise ConnectError(f"No addresses found for {hostname!r}", request=request)
         return ip_strs
+
+    async def _select_reachable(
+        self,
+        request: Request,
+        ip_strs: list[str],
+        port: int,
+    ) -> str:
+        if len(ip_strs) == 1:
+            return ip_strs[0]
+
+        # Happy Eyeballs over the validated addresses only. Connecting to the IP
+        # literals (not the hostname) avoids a second, unvalidated DNS lookup.
+        selected: str | None = None
+        errors: list[OSError] = []
+
+        async def try_connect(ip_str: str, event: Event) -> None:
+            nonlocal selected
+            try:
+                stream = await connect_tcp(ip_str, port)
+            except OSError as e:
+                errors.append(e)
+                return
+            else:
+                await stream.aclose()
+                if selected is None:
+                    selected = ip_str
+                    tg.cancel_scope.cancel()
+            finally:
+                event.set()
+
+        try:
+            with fail_after(self.connect_timeout):
+                async with create_task_group() as tg:
+                    for ip_str in ip_strs:
+                        event = Event()
+                        tg.start_soon(try_connect, ip_str, event)
+                        with move_on_after(self.happy_eyeballs_delay):
+                            await event.wait()
+        except TimeoutError as e:
+            raise ConnectTimeout(str(e), request=request) from e
+
+        if selected is None:
+            raise ConnectError(
+                f"All connection attempts failed: {errors[-1]}",
+                request=request,
+            )
+        return selected
 
     async def _validate(
         self,
@@ -210,7 +282,7 @@ class _SSRFProtectionHook:
                 self._cache.put(cache_key, e)
                 raise
 
-            ip_str = ip_strs[0]
+            ip_str = await self._select_reachable(request, ip_strs, port)
             self._cache.put(cache_key, ip_str)
             return ip_str
 
@@ -239,7 +311,7 @@ def httpx_ssrf_protection(
     ) = None,
     dns_cache_size: int = 1000,
     dns_cache_ttl: float = 600,
-    happy_eyeballs_delay: float = 0.25,  # noqa: ARG001
+    happy_eyeballs_delay: float = 0.25,
 ) -> _AsyncClientT:
     """
     Configure SSRF protection on an httpx AsyncClient with DNS caching.
@@ -250,8 +322,8 @@ def httpx_ssrf_protection(
         custom_validator: Additional validation function(hostname, ip, port) -> bool
         dns_cache_size: Maximum number of DNS resolutions to cache
         dns_cache_ttl: Time-to-live for cached DNS resolutions in seconds
-        happy_eyeballs_delay: Deprecated, has no effect (hostnames are resolved
-            with DNS instead of a test connection)
+        happy_eyeballs_delay: Delay in seconds before starting the next connection
+            attempt, when a hostname resolves to more than one address
     Returns:
         The same client instance with SSRF protection configured.
     """
@@ -267,6 +339,7 @@ def httpx_ssrf_protection(
             check_globally_reachable=check_globally_reachable,
             connect_timeout=client.timeout.connect,
             custom_validator=custom_validator,
+            happy_eyeballs_delay=happy_eyeballs_delay,
         ),
     )
     return client
