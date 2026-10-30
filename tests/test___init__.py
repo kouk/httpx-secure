@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 from ipaddress import IPv4Address, IPv6Address, ip_address
-from unittest.mock import AsyncMock, Mock, patch
+from socket import AF_INET, AF_INET6, SOCK_STREAM
+from unittest.mock import patch
 
 import pytest
-from anyio import getaddrinfo
-from httpx import AsyncClient, ConnectError, Request
+from anyio import getaddrinfo, sleep
+from httpx import AsyncClient, ConnectError, ConnectTimeout, Request, Timeout
 
 from httpx_secure import SSRFProtectionError, httpx_ssrf_protection
-
-TYPE_CHECKING = False
-if TYPE_CHECKING:
-    from anyio.abc import IPAddressType
 
 MOCK_DEFAULT_IP = "1.2.3.4"
 
@@ -24,35 +21,29 @@ def success_hook(_: Request):
     raise SuccessError
 
 
-def mock_tcp(default_ip: str = MOCK_DEFAULT_IP):
-    async def connect_tcp(remote_host: IPAddressType, remote_port: int, *_, **__):
-        hostname = str(remote_host)
-        port = remote_port
-
-        if "." not in hostname:
+def mock_dns(default_ips: tuple[str, ...] = (MOCK_DEFAULT_IP,)):
+    async def mock_getaddrinfo(host: str, port: int, *_, **__):
+        if "." not in host:
             # Resolve local hosts
-            addr_info = await getaddrinfo(hostname, port)
-            resolved_ip = addr_info[0][4][0]
-        else:
-            try:
-                ip_address(hostname)
-                resolved_ip = hostname
-            except ValueError:
-                resolved_ip = default_ip
+            return await getaddrinfo(host, port, type=SOCK_STREAM)
 
-        stream = Mock()
-        stream._raw_socket = Mock()
-        stream._raw_socket.getpeername.return_value = (resolved_ip, port)
-        stream.__aenter__ = AsyncMock(return_value=stream)
-        stream.__aexit__ = AsyncMock(return_value=None)
-        return stream
+        try:
+            ip_address(host)
+            ips: tuple[str, ...] = (host,)
+        except ValueError:
+            ips = default_ips
 
-    return connect_tcp
+        return [
+            (AF_INET6 if ":" in ip else AF_INET, SOCK_STREAM, 6, "", (ip, port))
+            for ip in ips
+        ]
+
+    return mock_getaddrinfo
 
 
 @pytest.fixture(autouse=True)
-def mock_tcp_fixture():
-    with patch("httpx_secure.connect_tcp", side_effect=mock_tcp()) as mock:
+def mock_dns_fixture():
+    with patch("httpx_secure.getaddrinfo", side_effect=mock_dns()) as mock:
         yield mock
 
 
@@ -118,15 +109,15 @@ async def test_dns_resolution_rewrites_host_header():
             await client.get("https://example.com/")
 
 
-async def test_dns_results_are_cached(mock_tcp_fixture):
+async def test_dns_results_are_cached(mock_dns_fixture):
     call_count = 0
 
     async def counter(*args, **kwargs):
         nonlocal call_count
         call_count += 1
-        return await mock_tcp()(*args, **kwargs)
+        return await mock_dns()(*args, **kwargs)
 
-    mock_tcp_fixture.side_effect = counter
+    mock_dns_fixture.side_effect = counter
 
     async with httpx_ssrf_protection(AsyncClient(), dns_cache_ttl=5) as client:
         client.event_hooks["request"].append(success_hook)
@@ -176,14 +167,74 @@ async def test_custom_validator_blocks_specific_ips():
         assert call_count == 2
 
 
-async def test_dns_resolution_failure_raises_error(mock_tcp_fixture):
-    mock_tcp_fixture.side_effect = OSError("Name or service not known")
+async def test_dns_resolution_failure_raises_error(mock_dns_fixture):
+    mock_dns_fixture.side_effect = OSError("Name or service not known")
 
     async with httpx_ssrf_protection(AsyncClient()) as client:
         with pytest.raises(ConnectError, match="Name or service not known"):
             await client.get(
                 "http://this-hostname-definitely-does-not-exist/",
             )
+
+
+async def test_dns_resolution_timeout_raises_error(mock_dns_fixture):
+    async def slow_getaddrinfo(*_, **__):
+        await sleep(1)
+
+    mock_dns_fixture.side_effect = slow_getaddrinfo
+
+    async with httpx_ssrf_protection(
+        AsyncClient(timeout=Timeout(5, connect=0.01)),
+    ) as client:
+        with pytest.raises(ConnectTimeout):
+            await client.get("https://example.com/")
+
+
+async def test_empty_dns_result_raises_error(mock_dns_fixture):
+    mock_dns_fixture.side_effect = mock_dns(default_ips=())
+
+    async with httpx_ssrf_protection(AsyncClient()) as client:
+        with pytest.raises(ConnectError, match="No addresses found"):
+            await client.get("https://example.com/")
+
+
+@pytest.mark.parametrize(
+    "ips",
+    [
+        ("1.1.1.1", "10.0.0.1"),
+        ("10.0.0.1", "1.1.1.1"),
+        ("1.1.1.1", "::1"),
+    ],
+)
+async def test_blocks_when_any_resolved_address_is_private(mock_dns_fixture, ips):
+    mock_dns_fixture.side_effect = mock_dns(default_ips=ips)
+
+    async with httpx_ssrf_protection(AsyncClient()) as client:
+        client.event_hooks["request"].append(success_hook)
+        with pytest.raises(SSRFProtectionError, match="not globally reachable"):
+            await client.get("https://example.com/")
+
+
+async def test_uses_first_resolved_address(mock_dns_fixture):
+    mock_dns_fixture.side_effect = mock_dns(
+        default_ips=("2001:4860:4860::8888", "8.8.8.8", "8.8.8.8"),
+    )
+
+    async def success_hook(request: Request):
+        assert request.url.host == "2001:4860:4860::8888"
+        raise SuccessError
+
+    async with httpx_ssrf_protection(AsyncClient()) as client:
+        client.event_hooks["request"].append(success_hook)
+        with pytest.raises(SuccessError):
+            await client.get("https://example.com/")
+
+
+async def test_does_not_connect_before_validation():
+    with patch("socket.socket.connect", side_effect=AssertionError("connected")):
+        async with httpx_ssrf_protection(AsyncClient()) as client:
+            with pytest.raises(SSRFProtectionError):
+                await client.get("http://10.0.0.1/")
 
 
 async def test_skips_global_check_when_disabled():

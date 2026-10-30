@@ -3,10 +3,11 @@ from __future__ import annotations
 from collections import OrderedDict
 from inspect import isawaitable
 from ipaddress import ip_address
+from socket import SOCK_STREAM
 from time import monotonic
 from weakref import WeakValueDictionary
 
-from anyio import Lock, connect_tcp, fail_after
+from anyio import Lock, fail_after, getaddrinfo
 from httpx import ConnectError, ConnectTimeout, RequestError
 
 TYPE_CHECKING = False
@@ -97,7 +98,6 @@ class _SSRFProtectionHook:
         "check_globally_reachable",
         "connect_timeout",
         "custom_validator",
-        "happy_eyeballs_delay",
     )
 
     def __init__(
@@ -113,28 +113,32 @@ class _SSRFProtectionHook:
             ]
             | None
         ),
-        happy_eyeballs_delay: float,
     ):
         self._cache = cache
         self._locks: WeakValueDictionary[_CacheKey, Lock] = WeakValueDictionary()
         self.check_globally_reachable = check_globally_reachable
         self.connect_timeout = connect_timeout
         self.custom_validator = custom_validator
-        self.happy_eyeballs_delay = happy_eyeballs_delay
 
-    async def _resolve(self, request: Request, hostname: str, port: int) -> str:
+    async def _resolve(
+        self,
+        request: Request,
+        hostname: str,
+        port: int,
+    ) -> list[str]:
         try:
             with fail_after(self.connect_timeout):
-                async with await connect_tcp(
-                    hostname,
-                    port,
-                    happy_eyeballs_delay=self.happy_eyeballs_delay,
-                ) as stream:
-                    return stream._raw_socket.getpeername()[0]
+                addr_info = await getaddrinfo(hostname, port, type=SOCK_STREAM)
         except TimeoutError as e:
             raise ConnectTimeout(str(e), request=request) from e
         except OSError as e:
             raise ConnectError(str(e), request=request) from e
+
+        # Preserve the order returned by the resolver, drop duplicates
+        ip_strs = list(dict.fromkeys(str(info[4][0]) for info in addr_info))
+        if not ip_strs:
+            raise ConnectError(f"No addresses found for {hostname!r}", request=request)
+        return ip_strs
 
     async def _validate(
         self,
@@ -196,14 +200,17 @@ class _SSRFProtectionHook:
                     raise result
                 return result
 
-            ip_str = await self._resolve(request, hostname, port)
+            ip_strs = await self._resolve(request, hostname, port)
 
+            # Every address must pass, so the resolver cannot pick a blocked one later
             try:
-                await self._validate(ip_str, port, hostname)
+                for ip_str in ip_strs:
+                    await self._validate(ip_str, port, hostname)
             except SSRFProtectionError as e:
                 self._cache.put(cache_key, e)
                 raise
 
+            ip_str = ip_strs[0]
             self._cache.put(cache_key, ip_str)
             return ip_str
 
@@ -232,7 +239,7 @@ def httpx_ssrf_protection(
     ) = None,
     dns_cache_size: int = 1000,
     dns_cache_ttl: float = 600,
-    happy_eyeballs_delay: float = 0.25,
+    happy_eyeballs_delay: float = 0.25,  # noqa: ARG001
 ) -> _AsyncClientT:
     """
     Configure SSRF protection on an httpx AsyncClient with DNS caching.
@@ -243,7 +250,8 @@ def httpx_ssrf_protection(
         custom_validator: Additional validation function(hostname, ip, port) -> bool
         dns_cache_size: Maximum number of DNS resolutions to cache
         dns_cache_ttl: Time-to-live for cached DNS resolutions in seconds
-        happy_eyeballs_delay: Delay in seconds before starting the next connection attempt
+        happy_eyeballs_delay: Deprecated, has no effect (hostnames are resolved
+            with DNS instead of a test connection)
     Returns:
         The same client instance with SSRF protection configured.
     """
@@ -259,7 +267,6 @@ def httpx_ssrf_protection(
             check_globally_reachable=check_globally_reachable,
             connect_timeout=client.timeout.connect,
             custom_validator=custom_validator,
-            happy_eyeballs_delay=happy_eyeballs_delay,
         ),
     )
     return client
